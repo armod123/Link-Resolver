@@ -90,6 +90,41 @@ async def _has_cloudflare_challenge(page: Page) -> bool:
         return False
 
 
+async def _try_click_turnstile(page: Page, log) -> None:
+    """Try to click the Cloudflare Turnstile checkbox inside its iframe."""
+    try:
+        # Turnstile renders in an iframe from challenges.cloudflare.com
+        cf_frame = None
+        for frame in page.frames:
+            if "challenges.cloudflare.com" in frame.url:
+                cf_frame = frame
+                break
+        if cf_frame:
+            # The checkbox is typically an input or a div inside the iframe
+            checkbox = cf_frame.locator(
+                'input[type="checkbox"], '
+                '.ctp-checkbox-label, '
+                '#challenge-stage'
+            ).first
+            if await checkbox.is_visible(timeout=2000):
+                await checkbox.click(timeout=3000)
+                await log("☁️ Clicked Turnstile checkbox")
+                return
+        # Fallback: click the Turnstile widget container directly
+        widget = page.locator('.cf-turnstile iframe, iframe[src*="challenges.cloudflare.com"]').first
+        if await widget.is_visible(timeout=1000):
+            box = await widget.bounding_box()
+            if box:
+                # Click center of the iframe (where the checkbox typically is)
+                await page.mouse.click(
+                    box["x"] + box["width"] / 2,
+                    box["y"] + box["height"] / 2,
+                )
+                await log("☁️ Clicked Turnstile widget area")
+    except Exception:
+        pass
+
+
 async def _wait_for_cloudflare(page: Page, log, timeout: float = 30) -> bool:
     """Wait for a Cloudflare Turnstile challenge to auto-resolve.
 
@@ -98,6 +133,7 @@ async def _wait_for_cloudflare(page: Page, log, timeout: float = 30) -> bool:
     await log("☁️ Cloudflare Turnstile detected, waiting for auto-resolution…")
     start = time.monotonic()
     initial_url = page.url
+    clicked = False
     while time.monotonic() - start < timeout:
         await asyncio.sleep(1.5)
         # If the page navigated away, challenge was cleared
@@ -109,6 +145,10 @@ async def _wait_for_cloudflare(page: Page, log, timeout: float = 30) -> bool:
         if not still_present:
             await log("☁️ Cloudflare challenge cleared!")
             return True
+        # Try clicking the Turnstile checkbox after a short delay
+        if not clicked and time.monotonic() - start > 3:
+            await _try_click_turnstile(page, log)
+            clicked = True
     await log("⚠ Cloudflare challenge did not auto-resolve")
     return False
 
@@ -250,25 +290,6 @@ async def _launch_browser(pw, headless: bool, log):
     return browser, context, page
 
 
-async def _bypass_cloudflare_headed(pw, url: str, log) -> Optional[str]:
-    """Re-launch in headed (visible) mode to pass Cloudflare Turnstile.
-
-    Returns the post-challenge URL if successful, None otherwise.
-    """
-    await log("☁️ Headless blocked by Cloudflare – retrying in headed mode…")
-    browser, context, page = await _launch_browser(pw, headless=False, log=log)
-    try:
-        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
-        cleared = await _wait_for_cloudflare(page, log, timeout=30)
-        if cleared:
-            # Grab cookies so we can transfer them to headless session
-            final_url = page.url
-            return final_url
-        return None
-    finally:
-        await browser.close()
-
-
 async def _resolve_once(
     url: str,
     log: Callable[[str], Awaitable[None]],
@@ -281,6 +302,7 @@ async def _resolve_once(
 
     async with async_playwright() as pw:
         browser, context, page = await _launch_browser(pw, headless=True, log=log)
+        using_headed = False
 
         await log(f"🌐 Navigating to {url}")
         try:
@@ -294,18 +316,19 @@ async def _resolve_once(
             cleared = await _wait_for_cloudflare(page, log, timeout=10)
             if not cleared:
                 # Headless can't pass Turnstile – switch to headed mode
+                # and stay in it for the entire resolution
                 await browser.close()
-                post_cf_url = await _bypass_cloudflare_headed(pw, url, log)
-                if post_cf_url:
-                    # Re-launch headless and continue from the post-challenge URL
-                    url = post_cf_url
-                    await log(f"☁️ Resuming headless from {url}")
+                await log("☁️ Headless blocked by Cloudflare – switching to headed mode…")
                 browser, context, page = await _launch_browser(
-                    pw, headless=True, log=log
+                    pw, headless=False, log=log
                 )
+                using_headed = True
                 await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                await _wait_for_cloudflare(page, log, timeout=30)
 
-        await _inject_timer_bypass(page)
+        # Only inject timer bypass when not on a Cloudflare page
+        if not await _has_cloudflare_challenge(page):
+            await _inject_timer_bypass(page)
 
         deadline = time.monotonic() + timeout
         last_url = page.url
@@ -328,24 +351,21 @@ async def _resolve_once(
 
             # Check for Cloudflare challenge before proceeding
             if await _has_cloudflare_challenge(page):
-                cleared = await _wait_for_cloudflare(page, log, timeout=10)
-                if not cleared:
-                    # Switch to headed mode for this challenge
+                if not using_headed:
+                    # Switch to headed mode and stay for the rest
                     current_cf_url = page.url
                     await browser.close()
-                    post_cf_url = await _bypass_cloudflare_headed(
-                        pw, current_cf_url, log
-                    )
-                    if post_cf_url:
-                        current_cf_url = post_cf_url
+                    await log("☁️ Cloudflare detected mid-chain – switching to headed mode…")
                     browser, context, page = await _launch_browser(
-                        pw, headless=True, log=log
+                        pw, headless=False, log=log
                     )
+                    using_headed = True
                     await page.goto(
                         current_cf_url,
                         wait_until="domcontentloaded",
                         timeout=15000,
                     )
+                await _wait_for_cloudflare(page, log, timeout=30)
                 idle_rounds = 0
                 continue
 
