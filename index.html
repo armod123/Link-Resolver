@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Link Resolver</title>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0a0a0f;
+            --surface: #12121a;
+            --surface-2: #1a1a28;
+            --border: #2a2a3d;
+            --text: #e4e4ef;
+            --text-dim: #8888a4;
+            --accent: #6c5ce7;
+            --accent-glow: rgba(108, 92, 231, 0.3);
+            --green: #00d2a0;
+            --green-glow: rgba(0, 210, 160, 0.3);
+            --red: #ff6b6b;
+            --yellow: #ffd93d;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: 'Space Grotesk', sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            padding: 2rem 1rem;
+        }
+
+        .container {
+            max-width: 720px;
+            width: 100%;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 2.5rem;
+        }
+
+        h1 {
+            font-size: 2.2rem;
+            font-weight: 700;
+            letter-spacing: -0.03em;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--accent) 0%, var(--green) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        header p {
+            color: var(--text-dim);
+            font-size: 0.95rem;
+            line-height: 1.5;
+        }
+
+        .input-group {
+            display: flex;
+            gap: 0.75rem;
+            margin-bottom: 2rem;
+        }
+
+        input[type="text"] {
+            flex: 1;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            padding: 0.9rem 1.2rem;
+            color: var(--text);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.9rem;
+            outline: none;
+            transition: border-color 0.2s, box-shadow 0.2s;
+        }
+
+        input[type="text"]:focus {
+            border-color: var(--accent);
+            box-shadow: 0 0 0 3px var(--accent-glow);
+        }
+
+        input[type="text"]::placeholder {
+            color: var(--text-dim);
+            opacity: 0.6;
+        }
+
+        button {
+            background: var(--accent);
+            color: white;
+            border: none;
+            border-radius: 12px;
+            padding: 0.9rem 1.8rem;
+            font-family: 'Space Grotesk', sans-serif;
+            font-weight: 600;
+            font-size: 0.95rem;
+            cursor: pointer;
+            transition: all 0.2s;
+            white-space: nowrap;
+        }
+
+        button:hover:not(:disabled) {
+            background: #7c6ff0;
+            box-shadow: 0 4px 20px var(--accent-glow);
+            transform: translateY(-1px);
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .log-container {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            overflow: hidden;
+            display: none;
+        }
+
+        .log-container.active { display: block; }
+
+        .log-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 1rem 1.5rem;
+            border-bottom: 1px solid var(--border);
+            background: var(--surface-2);
+        }
+
+        .log-header h3 {
+            font-size: 0.85rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-dim);
+        }
+
+        .status-badge {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            padding: 0.3rem 0.8rem;
+            border-radius: 20px;
+            font-weight: 600;
+        }
+
+        .status-badge.running {
+            background: rgba(108, 92, 231, 0.15);
+            color: var(--accent);
+            border: 1px solid rgba(108, 92, 231, 0.3);
+        }
+
+        .status-badge.success {
+            background: rgba(0, 210, 160, 0.15);
+            color: var(--green);
+            border: 1px solid rgba(0, 210, 160, 0.3);
+        }
+
+        .status-badge.error {
+            background: rgba(255, 107, 107, 0.15);
+            color: var(--red);
+            border: 1px solid rgba(255, 107, 107, 0.3);
+        }
+
+        .log-body {
+            padding: 1rem 1.5rem;
+            max-height: 400px;
+            overflow-y: auto;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            line-height: 1.8;
+        }
+
+        .log-body::-webkit-scrollbar {
+            width: 6px;
+        }
+
+        .log-body::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .log-body::-webkit-scrollbar-thumb {
+            background: var(--border);
+            border-radius: 3px;
+        }
+
+        .log-line {
+            color: var(--text-dim);
+            animation: fadeIn 0.3s ease;
+        }
+
+        .log-line.highlight {
+            color: var(--green);
+            font-weight: 600;
+        }
+
+        .log-line.error-line {
+            color: var(--red);
+        }
+
+        .log-line.warn-line {
+            color: var(--yellow);
+        }
+
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(4px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        .result-card {
+            margin-top: 1rem;
+            padding: 1.5rem;
+            border-top: 1px solid var(--border);
+            display: none;
+        }
+
+        .result-card.active { display: block; }
+
+        .result-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--text-dim);
+            margin-bottom: 0.5rem;
+        }
+
+        .result-url {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 0.9rem 1.2rem;
+            display: flex;
+            align-items: center;
+            gap: 0.75rem;
+        }
+
+        .result-url a {
+            color: var(--green);
+            text-decoration: none;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            word-break: break-all;
+            flex: 1;
+        }
+
+        .result-url a:hover {
+            text-decoration: underline;
+        }
+
+        .copy-btn {
+            background: var(--surface-2);
+            border: 1px solid var(--border);
+            color: var(--text-dim);
+            padding: 0.4rem 0.8rem;
+            border-radius: 8px;
+            font-size: 0.75rem;
+            cursor: pointer;
+            font-family: 'Space Grotesk', sans-serif;
+            transition: all 0.2s;
+        }
+
+        .copy-btn:hover {
+            border-color: var(--accent);
+            color: var(--text);
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid var(--accent-glow);
+            border-top-color: var(--accent);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        .info-box {
+            margin-top: 2rem;
+            padding: 1.2rem 1.5rem;
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            font-size: 0.85rem;
+            color: var(--text-dim);
+            line-height: 1.6;
+        }
+
+        .info-box strong {
+            color: var(--text);
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>⚡ Link Resolver</h1>
+            <p>Paste a rinku.pro / 7mb.io link and skip the ads automatically.</p>
+        </header>
+
+        <div class="input-group">
+            <input type="text" id="urlInput" placeholder="https://rinku.pro/hSzkppLs" autofocus>
+            <button id="resolveBtn" onclick="startResolve()">Resolve</button>
+        </div>
+
+        <div class="log-container" id="logContainer">
+            <div class="log-header">
+                <h3>Resolution Log</h3>
+                <span class="status-badge running" id="statusBadge">
+                    <span class="spinner"></span> Running
+                </span>
+            </div>
+            <div class="log-body" id="logBody"></div>
+            <div class="result-card" id="resultCard">
+                <div class="result-label">Final destination</div>
+                <div class="result-url">
+                    <a id="finalUrl" href="#" target="_blank" rel="noopener"></a>
+                    <button class="copy-btn" onclick="copyUrl()">Copy</button>
+                </div>
+            </div>
+        </div>
+
+        <div class="info-box">
+            <strong>How it works:</strong> A headless browser navigates through the 
+            redirect chain, bypasses countdown timers and focus-detection tricks, 
+            clicks through intermediate pages, and extracts the final video URL.
+            <br><br>
+            <strong>Note:</strong> Some links may require CAPTCHAs that can't be 
+            bypassed automatically. The resolver will report this if encountered.
+        </div>
+    </div>
+
+    <script>
+        const urlInput = document.getElementById('urlInput');
+        const resolveBtn = document.getElementById('resolveBtn');
+        const logContainer = document.getElementById('logContainer');
+        const logBody = document.getElementById('logBody');
+        const statusBadge = document.getElementById('statusBadge');
+        const resultCard = document.getElementById('resultCard');
+        const finalUrl = document.getElementById('finalUrl');
+
+        urlInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') startResolve();
+        });
+
+        async function startResolve() {
+            const url = urlInput.value.trim();
+            if (!url) return;
+
+            // Reset UI
+            resolveBtn.disabled = true;
+            resolveBtn.textContent = 'Resolving...';
+            logContainer.classList.add('active');
+            logBody.innerHTML = '';
+            resultCard.classList.remove('active');
+            statusBadge.className = 'status-badge running';
+            statusBadge.innerHTML = '<span class="spinner"></span> Running';
+
+            try {
+                const res = await fetch('/resolve', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ url }),
+                });
+                const data = await res.json();
+
+                if (data.error) {
+                    addLog(data.error, 'error-line');
+                    setStatus('error', 'Error');
+                    return;
+                }
+
+                // Connect to SSE stream
+                const evtSource = new EventSource(`/stream/${data.task_id}`);
+
+                evtSource.onmessage = (event) => {
+                    const msg = JSON.parse(event.data);
+
+                    if (msg.type === 'step') {
+                        let cls = '';
+                        if (msg.message.includes('✅')) cls = 'highlight';
+                        else if (msg.message.includes('❌')) cls = 'error-line';
+                        else if (msg.message.includes('⚠')) cls = 'warn-line';
+                        addLog(msg.message, cls);
+                    }
+                    else if (msg.type === 'done') {
+                        evtSource.close();
+                        if (msg.success) {
+                            setStatus('success', `Done in ${msg.elapsed}s`);
+                            finalUrl.href = msg.final_url;
+                            finalUrl.textContent = msg.final_url;
+                            resultCard.classList.add('active');
+                        } else {
+                            setStatus('error', 'Failed');
+                            if (msg.error) addLog(`Error: ${msg.error}`, 'error-line');
+                            if (msg.final_url) {
+                                finalUrl.href = msg.final_url;
+                                finalUrl.textContent = msg.final_url + ' (may be incomplete)';
+                                resultCard.classList.add('active');
+                            }
+                        }
+                        resolveBtn.disabled = false;
+                        resolveBtn.textContent = 'Resolve';
+                    }
+                    else if (msg.type === 'error') {
+                        evtSource.close();
+                        addLog(msg.message, 'error-line');
+                        setStatus('error', 'Error');
+                        resolveBtn.disabled = false;
+                        resolveBtn.textContent = 'Resolve';
+                    }
+                };
+
+                evtSource.onerror = () => {
+                    evtSource.close();
+                    setStatus('error', 'Connection lost');
+                    resolveBtn.disabled = false;
+                    resolveBtn.textContent = 'Resolve';
+                };
+
+            } catch (err) {
+                addLog(`Network error: ${err.message}`, 'error-line');
+                setStatus('error', 'Error');
+                resolveBtn.disabled = false;
+                resolveBtn.textContent = 'Resolve';
+            }
+        }
+
+        function addLog(text, className = '') {
+            const line = document.createElement('div');
+            line.className = `log-line ${className}`;
+            line.textContent = text;
+            logBody.appendChild(line);
+            logBody.scrollTop = logBody.scrollHeight;
+        }
+
+        function setStatus(type, text) {
+            statusBadge.className = `status-badge ${type}`;
+            statusBadge.textContent = text;
+        }
+
+        function copyUrl() {
+            navigator.clipboard.writeText(finalUrl.href).then(() => {
+                const btn = document.querySelector('.copy-btn');
+                btn.textContent = 'Copied!';
+                setTimeout(() => btn.textContent = 'Copy', 1500);
+            });
+        }
+    </script>
+</body>
+</html>
