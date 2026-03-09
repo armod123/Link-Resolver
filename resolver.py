@@ -47,6 +47,10 @@ CONTINUE_BUTTON_SELECTORS = [
     "a.btn-main",
     "a.get-link",
     "a#get-link",
+    "#click",
+    "#redirect-link",
+    "button#invisibleCaptchaShortlink",
+    "[class^='btn-']",
     'a[href*="continue"]',
     "button.continue",
     'a:has-text("Get Link")',
@@ -77,8 +81,8 @@ async def _has_cloudflare_challenge(page: Page) -> bool:
             // Check for Turnstile iframe
             if (document.querySelector('iframe[src*="challenges.cloudflare.com"]'))
                 return true;
-            // Check for Turnstile container
-            if (document.querySelector('.cf-turnstile, [data-sitekey]'))
+            // Check for Turnstile container (but NOT reCAPTCHA data-sitekey)
+            if (document.querySelector('.cf-turnstile'))
                 return true;
             // Check for challenge text
             const body = document.body?.innerText || '';
@@ -88,6 +92,46 @@ async def _has_cloudflare_challenge(page: Page) -> bool:
         }""")
     except Exception:
         return False
+
+
+async def _has_recaptcha(page: Page) -> bool:
+    """Return True if the page contains a Google reCAPTCHA challenge."""
+    try:
+        return await page.evaluate("""() => {
+            if (document.querySelector('iframe[src*="/recaptcha/"]'))
+                return true;
+            if (document.querySelector('.g-recaptcha, #captcha-container'))
+                return true;
+            if (document.querySelector('#switchCaptcha'))
+                return true;
+            return false;
+        }""")
+    except Exception:
+        return False
+
+
+async def _try_click_recaptcha(page: Page, log) -> None:
+    """Try to click the reCAPTCHA 'I am not a robot' checkbox."""
+    try:
+        for frame in page.frames:
+            if "/recaptcha/" in frame.url and "anchor" in frame.url:
+                checkbox = frame.locator('#recaptcha-anchor, .recaptcha-checkbox')
+                if await checkbox.first.is_visible(timeout=2000):
+                    await checkbox.first.click(timeout=3000)
+                    await log("🤖 Clicked reCAPTCHA checkbox")
+                    return
+        # Fallback: click the reCAPTCHA iframe directly
+        iframe = page.locator('iframe[src*="/recaptcha/"][src*="anchor"]').first
+        if await iframe.is_visible(timeout=1000):
+            box = await iframe.bounding_box()
+            if box:
+                await page.mouse.click(
+                    box["x"] + 25,
+                    box["y"] + box["height"] / 2,
+                )
+                await log("🤖 Clicked reCAPTCHA area")
+    except Exception:
+        pass
 
 
 async def _try_click_turnstile(page: Page, log) -> None:
@@ -169,6 +213,10 @@ async def _inject_timer_bypass(page: Page) -> None:
         // Fake document visibility – always "visible"
         Object.defineProperty(document, 'hidden', {value: false, writable: false});
         Object.defineProperty(document, 'visibilityState', {value: 'visible', writable: false});
+
+        // Override document.hasFocus() – always return true
+        // (adslift.xyz and similar sites gate countdown timers on this)
+        document.hasFocus = () => true;
 
         // Suppress visibilitychange / blur events that pause timers
         document.addEventListener('visibilitychange', e => e.stopImmediatePropagation(), true);
@@ -375,6 +423,27 @@ async def _resolve_once(
             except Exception:
                 pass
 
+            # Handle reCAPTCHA if present (needs headed mode)
+            if await _has_recaptcha(page):
+                if not using_headed:
+                    current_rc_url = page.url
+                    await browser.close()
+                    await log("🤖 reCAPTCHA detected – switching to headed mode…")
+                    browser, context, page = await _launch_browser(
+                        pw, headless=False, log=log
+                    )
+                    using_headed = True
+                    await page.goto(
+                        current_rc_url,
+                        wait_until="domcontentloaded",
+                        timeout=15000,
+                    )
+                    await _inject_timer_bypass(page)
+                await _try_click_recaptcha(page, log)
+                await asyncio.sleep(3)
+                idle_rounds = 0
+                continue
+
             # Try clicking continue buttons
             clicked = await _try_click_continue(page)
             if clicked:
@@ -397,6 +466,23 @@ async def _resolve_once(
                 continue
 
             idle_rounds += 1
+
+            # Log page state when stuck to aid debugging
+            if idle_rounds == 10:
+                try:
+                    debug_info = await page.evaluate("""() => {
+                        const btns = [...document.querySelectorAll('a, button')]
+                            .filter(el => el.offsetParent !== null)
+                            .map(el => el.id || el.className || el.textContent?.trim().slice(0, 30))
+                            .filter(Boolean)
+                            .slice(0, 10);
+                        const iframes = [...document.querySelectorAll('iframe')]
+                            .map(f => f.src).filter(Boolean).slice(0, 5);
+                        return {buttons: btns, iframes: iframes, title: document.title};
+                    }""")
+                    await log(f"🔍 Page debug: {debug_info}")
+                except Exception:
+                    pass
 
             # If idle for too long, the page might be stuck
             if idle_rounds > 20:
