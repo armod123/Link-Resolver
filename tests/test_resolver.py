@@ -157,7 +157,9 @@ class TestResolveLink:
 
             mock_page.url = "https://example.com/final"
             mock_page.goto = AsyncMock()
-            mock_page.evaluate = AsyncMock()
+            # Return False for Cloudflare check, None for other evaluate calls
+            mock_page.evaluate = AsyncMock(return_value=False)
+            mock_page.add_init_script = AsyncMock()
 
             mock_context.new_page = AsyncMock(return_value=mock_page)
             mock_context.route = AsyncMock()
@@ -189,7 +191,8 @@ class TestResolveLink:
 
             mock_page.url = "https://example.com/video"
             mock_page.goto = AsyncMock()
-            mock_page.evaluate = AsyncMock()
+            mock_page.evaluate = AsyncMock(return_value=False)
+            mock_page.add_init_script = AsyncMock()
 
             mock_context.new_page = AsyncMock(return_value=mock_page)
             mock_context.route = AsyncMock()

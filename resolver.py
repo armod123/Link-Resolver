@@ -90,7 +90,7 @@ async def _has_cloudflare_challenge(page: Page) -> bool:
         return False
 
 
-async def _wait_for_cloudflare(page: Page, log, timeout: float = 20) -> bool:
+async def _wait_for_cloudflare(page: Page, log, timeout: float = 30) -> bool:
     """Wait for a Cloudflare Turnstile challenge to auto-resolve.
 
     Returns True if the challenge was cleared (page navigated away).
@@ -201,6 +201,74 @@ async def resolve_link(
     return ResolveResult(success=False, error="Unknown error")
 
 
+_STEALTH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=IsolateOrigins,site-per-process",
+]
+
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
+_WEBDRIVER_INIT_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+"""
+
+
+async def _launch_browser(pw, headless: bool, log):
+    """Launch a browser and create a stealth context + page."""
+    browser = await pw.chromium.launch(
+        headless=headless,
+        args=_STEALTH_ARGS,
+    )
+
+    context: BrowserContext = await browser.new_context(
+        user_agent=_USER_AGENT,
+        viewport={"width": 1280, "height": 720},
+        java_script_enabled=True,
+    )
+
+    # Block heavy resources to speed things up
+    await context.route(
+        "**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
+        lambda route: route.abort(),
+    )
+
+    page = await context.new_page()
+
+    # Remove navigator.webdriver flag to avoid bot detection
+    await page.add_init_script(_WEBDRIVER_INIT_SCRIPT)
+
+    # Close popup windows opened by ad scripts
+    context.on(
+        "page",
+        lambda new_page: asyncio.ensure_future(_close_popup(new_page, log)),
+    )
+
+    return browser, context, page
+
+
+async def _bypass_cloudflare_headed(pw, url: str, log) -> Optional[str]:
+    """Re-launch in headed (visible) mode to pass Cloudflare Turnstile.
+
+    Returns the post-challenge URL if successful, None otherwise.
+    """
+    await log("☁️ Headless blocked by Cloudflare – retrying in headed mode…")
+    browser, context, page = await _launch_browser(pw, headless=False, log=log)
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        cleared = await _wait_for_cloudflare(page, log, timeout=30)
+        if cleared:
+            # Grab cookies so we can transfer them to headless session
+            final_url = page.url
+            return final_url
+        return None
+    finally:
+        await browser.close()
+
+
 async def _resolve_once(
     url: str,
     log: Callable[[str], Awaitable[None]],
@@ -212,42 +280,7 @@ async def _resolve_once(
     await log(f"🚀 Starting resolution (attempt {attempt}/{max_retries})…")
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ],
-        )
-
-        context: BrowserContext = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 720},
-            java_script_enabled=True,
-        )
-
-        # Block heavy resources to speed things up
-        await context.route(
-            "**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
-            lambda route: route.abort(),
-        )
-
-        page = await context.new_page()
-
-        # Remove navigator.webdriver flag to avoid bot detection
-        await page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-        """)
-
-        # Close popup windows opened by ad scripts
-        context.on(
-            "page",
-            lambda new_page: asyncio.ensure_future(_close_popup(new_page, log)),
-        )
+        browser, context, page = await _launch_browser(pw, headless=True, log=log)
 
         await log(f"🌐 Navigating to {url}")
         try:
@@ -258,9 +291,21 @@ async def _resolve_once(
         # Check for Cloudflare challenge before injecting timer bypass
         # (timer override breaks Turnstile scripts)
         if await _has_cloudflare_challenge(page):
-            await _wait_for_cloudflare(page, log)
-        else:
-            await _inject_timer_bypass(page)
+            cleared = await _wait_for_cloudflare(page, log, timeout=10)
+            if not cleared:
+                # Headless can't pass Turnstile – switch to headed mode
+                await browser.close()
+                post_cf_url = await _bypass_cloudflare_headed(pw, url, log)
+                if post_cf_url:
+                    # Re-launch headless and continue from the post-challenge URL
+                    url = post_cf_url
+                    await log(f"☁️ Resuming headless from {url}")
+                browser, context, page = await _launch_browser(
+                    pw, headless=True, log=log
+                )
+                await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+
+        await _inject_timer_bypass(page)
 
         deadline = time.monotonic() + timeout
         last_url = page.url
@@ -283,10 +328,26 @@ async def _resolve_once(
 
             # Check for Cloudflare challenge before proceeding
             if await _has_cloudflare_challenge(page):
-                cleared = await _wait_for_cloudflare(page, log)
-                if cleared:
-                    idle_rounds = 0
-                    continue
+                cleared = await _wait_for_cloudflare(page, log, timeout=10)
+                if not cleared:
+                    # Switch to headed mode for this challenge
+                    current_cf_url = page.url
+                    await browser.close()
+                    post_cf_url = await _bypass_cloudflare_headed(
+                        pw, current_cf_url, log
+                    )
+                    if post_cf_url:
+                        current_cf_url = post_cf_url
+                    browser, context, page = await _launch_browser(
+                        pw, headless=True, log=log
+                    )
+                    await page.goto(
+                        current_cf_url,
+                        wait_until="domcontentloaded",
+                        timeout=15000,
+                    )
+                idle_rounds = 0
+                continue
 
             # Re-inject timer bypass on each page (safe now – no Cloudflare)
             try:
