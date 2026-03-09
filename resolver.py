@@ -1,0 +1,312 @@
+"""
+Link Resolver – Playwright-based redirect chain navigator.
+
+Navigates through rinku.pro / 7mb.io / Fly Inc shortener pages,
+bypasses countdown timers and focus-detection tricks, and returns
+the final destination URL.
+"""
+
+import asyncio
+import sys
+import time
+from dataclasses import dataclass, field
+from typing import Callable, Awaitable, Optional
+
+from playwright.async_api import async_playwright, Page, BrowserContext
+
+# ---------------------------------------------------------------------------
+# Result data class
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ResolveResult:
+    success: bool
+    final_url: Optional[str] = None
+    elapsed_seconds: Optional[float] = None
+    error: Optional[str] = None
+
+
+# ---------------------------------------------------------------------------
+# Known shortener / intermediate domains
+# ---------------------------------------------------------------------------
+
+SHORTENER_DOMAINS = [
+    "rinku.pro",
+    "7mb.io",
+    "flyinc.xyz",
+    "fly-link.io",
+    "fly-url.com",
+    "shrinkforearn.in",
+    "earnfly.io",
+]
+
+# Patterns that indicate an intermediate "continue" page
+CONTINUE_BUTTON_SELECTORS = [
+    "a#btn-main",
+    "a.btn-main",
+    "a.get-link",
+    "a#get-link",
+    'a[href*="continue"]',
+    "button.continue",
+    'a:has-text("Get Link")',
+    'a:has-text("Continue")',
+    'a:has-text("Click here")',
+    'a:has-text("Go to Link")',
+    'button:has-text("Continue")',
+    'button:has-text("Get Link")',
+]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _is_shortener_url(url: str) -> bool:
+    """Return True if *url* belongs to a known shortener domain."""
+    for domain in SHORTENER_DOMAINS:
+        if domain in url:
+            return True
+    return False
+
+
+async def _inject_timer_bypass(page: Page) -> None:
+    """Inject JS that speeds up countdown timers and disables focus checks."""
+    await page.evaluate("""() => {
+        // Override setInterval so timers tick every 1ms
+        const _origSetInterval = window.setInterval;
+        window.setInterval = (fn, delay, ...args) =>
+            _origSetInterval(fn, 1, ...args);
+
+        // Override setTimeout similarly
+        const _origSetTimeout = window.setTimeout;
+        window.setTimeout = (fn, delay, ...args) =>
+            _origSetTimeout(fn, 1, ...args);
+
+        // Fake document visibility – always "visible"
+        Object.defineProperty(document, 'hidden', {value: false, writable: false});
+        Object.defineProperty(document, 'visibilityState', {value: 'visible', writable: false});
+
+        // Suppress visibilitychange / blur events that pause timers
+        document.addEventListener('visibilitychange', e => e.stopImmediatePropagation(), true);
+        window.addEventListener('blur', e => e.stopImmediatePropagation(), true);
+        window.addEventListener('focus', e => e.stopImmediatePropagation(), true);
+    }""")
+
+
+async def _try_click_continue(page: Page) -> bool:
+    """Try to find and click a continue / get-link button. Returns True if clicked."""
+    for selector in CONTINUE_BUTTON_SELECTORS:
+        try:
+            btn = page.locator(selector).first
+            if await btn.is_visible(timeout=300):
+                await btn.click(timeout=2000)
+                return True
+        except Exception:
+            continue
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Main resolver
+# ---------------------------------------------------------------------------
+
+async def resolve_link(
+    url: str,
+    callback: Optional[Callable[[str], Awaitable[None]]] = None,
+    timeout: float = 60,
+    max_retries: int = 2,
+) -> ResolveResult:
+    """
+    Navigate through a shortener redirect chain and return the final URL.
+
+    Parameters
+    ----------
+    url : str
+        The shortener URL to resolve.
+    callback : async callable, optional
+        An ``async def callback(message: str)`` invoked with progress updates.
+    timeout : float
+        Maximum seconds before giving up (default 60).
+    max_retries : int
+        How many times to retry on failure (default 2).
+    """
+
+    async def log(msg: str) -> None:
+        if callback:
+            await callback(msg)
+
+    start = time.monotonic()
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await _resolve_once(url, log, timeout, attempt, max_retries)
+        except Exception as exc:
+            elapsed = round(time.monotonic() - start, 1)
+            if attempt < max_retries:
+                await log(f"⚠ Attempt {attempt} failed ({exc}), retrying…")
+            else:
+                await log(f"❌ All {max_retries} attempts failed.")
+                return ResolveResult(
+                    success=False,
+                    final_url=None,
+                    elapsed_seconds=elapsed,
+                    error=str(exc),
+                )
+
+    # Should never reach here, but just in case
+    return ResolveResult(success=False, error="Unknown error")
+
+
+async def _resolve_once(
+    url: str,
+    log: Callable[[str], Awaitable[None]],
+    timeout: float,
+    attempt: int,
+    max_retries: int,
+) -> ResolveResult:
+    start = time.monotonic()
+    await log(f"🚀 Starting resolution (attempt {attempt}/{max_retries})…")
+
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
+
+        context: BrowserContext = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 720},
+            java_script_enabled=True,
+        )
+
+        # Block heavy resources to speed things up
+        await context.route(
+            "**/*.{png,jpg,jpeg,gif,webp,svg,ico,woff,woff2,ttf,eot}",
+            lambda route: route.abort(),
+        )
+
+        page = await context.new_page()
+
+        # Close popup windows opened by ad scripts
+        context.on(
+            "page",
+            lambda new_page: asyncio.ensure_future(_close_popup(new_page, log)),
+        )
+
+        await log(f"🌐 Navigating to {url}")
+        try:
+            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+        except Exception as e:
+            await log(f"⚠ Initial navigation issue: {e}")
+
+        await _inject_timer_bypass(page)
+
+        deadline = time.monotonic() + timeout
+        last_url = page.url
+        idle_rounds = 0
+
+        while time.monotonic() < deadline:
+            current_url = page.url
+            await log(f"📍 Current URL: {current_url}")
+
+            # If we've left all shortener domains, we're done
+            if not _is_shortener_url(current_url) and current_url != url:
+                elapsed = round(time.monotonic() - start, 1)
+                await log(f"✅ Resolved to final URL in {elapsed}s")
+                await browser.close()
+                return ResolveResult(
+                    success=True,
+                    final_url=current_url,
+                    elapsed_seconds=elapsed,
+                )
+
+            # Re-inject timer bypass on each page
+            try:
+                await _inject_timer_bypass(page)
+            except Exception:
+                pass
+
+            # Try clicking continue buttons
+            clicked = await _try_click_continue(page)
+            if clicked:
+                await log("🖱️ Clicked continue button")
+                idle_rounds = 0
+                # Wait for potential navigation
+                try:
+                    await page.wait_for_load_state("domcontentloaded", timeout=5000)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.5)
+                continue
+
+            # Check if URL changed without a click
+            if current_url != last_url:
+                await log(f"🔄 Redirect detected")
+                last_url = current_url
+                idle_rounds = 0
+                await asyncio.sleep(0.5)
+                continue
+
+            idle_rounds += 1
+
+            # If idle for too long, the page might be stuck
+            if idle_rounds > 20:
+                await log("⚠ Page appears stuck, attempting reload")
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=10000)
+                    await _inject_timer_bypass(page)
+                except Exception:
+                    pass
+                idle_rounds = 0
+
+            await asyncio.sleep(1)
+
+        # Timed out
+        elapsed = round(time.monotonic() - start, 1)
+        final = page.url
+        await browser.close()
+
+        if not _is_shortener_url(final) and final != url:
+            await log(f"✅ Resolved (at timeout boundary) in {elapsed}s")
+            return ResolveResult(success=True, final_url=final, elapsed_seconds=elapsed)
+
+        await log(f"❌ Timed out after {elapsed}s")
+        return ResolveResult(
+            success=False,
+            final_url=final if final != url else None,
+            elapsed_seconds=elapsed,
+            error=f"Timed out after {elapsed}s",
+        )
+
+
+async def _close_popup(page: Page, log: Callable[[str], Awaitable[None]]) -> None:
+    """Close popup windows that ad scripts open."""
+    try:
+        await log(f"🚫 Closing popup: {page.url}")
+        await page.close()
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# CLI entry point
+# ---------------------------------------------------------------------------
+
+async def _cli_main(url: str) -> None:
+    async def printer(msg: str) -> None:
+        print(msg)
+
+    result = await resolve_link(url, callback=printer)
+    if result.success:
+        print(f"\nFinal URL: {result.final_url}")
+    else:
+        print(f"\nFailed: {result.error}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python resolver.py <URL>")
+        sys.exit(1)
+    asyncio.run(_cli_main(sys.argv[1]))
