@@ -110,4 +110,17 @@ def stream(task_id):
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000, threaded=True)
+    import os
+
+    # The watchdog reloader monitors all imported modules for changes.
+    # Playwright spawns a Node.js subprocess that touches files in
+    # site-packages, which triggers a spurious reload and kills the
+    # browser mid-resolution (EPIPE error).  Disabling the reloader
+    # prevents this; debug mode still gives nice tracebacks.
+    app.run(
+        debug=True,
+        host="0.0.0.0",
+        port=5000,
+        threaded=True,
+        use_reloader=False,
+    )
