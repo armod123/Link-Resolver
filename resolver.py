@@ -38,6 +38,7 @@ SHORTENER_DOMAINS = [
     "fly-url.com",
     "shrinkforearn.in",
     "earnfly.io",
+    "adslift.xyz",
 ]
 
 # Patterns that indicate an intermediate "continue" page
@@ -66,6 +67,49 @@ def _is_shortener_url(url: str) -> bool:
     for domain in SHORTENER_DOMAINS:
         if domain in url:
             return True
+    return False
+
+
+async def _has_cloudflare_challenge(page: Page) -> bool:
+    """Return True if the page contains a Cloudflare Turnstile challenge."""
+    try:
+        return await page.evaluate("""() => {
+            // Check for Turnstile iframe
+            if (document.querySelector('iframe[src*="challenges.cloudflare.com"]'))
+                return true;
+            // Check for Turnstile container
+            if (document.querySelector('.cf-turnstile, [data-sitekey]'))
+                return true;
+            // Check for challenge text
+            const body = document.body?.innerText || '';
+            if (body.includes('Verify you are human') || body.includes('Vérifiez que vous êtes humain'))
+                return true;
+            return false;
+        }""")
+    except Exception:
+        return False
+
+
+async def _wait_for_cloudflare(page: Page, log, timeout: float = 20) -> bool:
+    """Wait for a Cloudflare Turnstile challenge to auto-resolve.
+
+    Returns True if the challenge was cleared (page navigated away).
+    """
+    await log("☁️ Cloudflare Turnstile detected, waiting for auto-resolution…")
+    start = time.monotonic()
+    initial_url = page.url
+    while time.monotonic() - start < timeout:
+        await asyncio.sleep(1.5)
+        # If the page navigated away, challenge was cleared
+        if page.url != initial_url:
+            await log("☁️ Cloudflare challenge cleared!")
+            return True
+        # Check if the Turnstile widget disappeared
+        still_present = await _has_cloudflare_challenge(page)
+        if not still_present:
+            await log("☁️ Cloudflare challenge cleared!")
+            return True
+    await log("⚠ Cloudflare challenge did not auto-resolve")
     return False
 
 
@@ -168,7 +212,13 @@ async def _resolve_once(
     await log(f"🚀 Starting resolution (attempt {attempt}/{max_retries})…")
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True)
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
+        )
 
         context: BrowserContext = await browser.new_context(
             user_agent=(
@@ -188,6 +238,11 @@ async def _resolve_once(
 
         page = await context.new_page()
 
+        # Remove navigator.webdriver flag to avoid bot detection
+        await page.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+        """)
+
         # Close popup windows opened by ad scripts
         context.on(
             "page",
@@ -200,7 +255,12 @@ async def _resolve_once(
         except Exception as e:
             await log(f"⚠ Initial navigation issue: {e}")
 
-        await _inject_timer_bypass(page)
+        # Check for Cloudflare challenge before injecting timer bypass
+        # (timer override breaks Turnstile scripts)
+        if await _has_cloudflare_challenge(page):
+            await _wait_for_cloudflare(page, log)
+        else:
+            await _inject_timer_bypass(page)
 
         deadline = time.monotonic() + timeout
         last_url = page.url
@@ -221,7 +281,14 @@ async def _resolve_once(
                     elapsed_seconds=elapsed,
                 )
 
-            # Re-inject timer bypass on each page
+            # Check for Cloudflare challenge before proceeding
+            if await _has_cloudflare_challenge(page):
+                cleared = await _wait_for_cloudflare(page, log)
+                if cleared:
+                    idle_rounds = 0
+                    continue
+
+            # Re-inject timer bypass on each page (safe now – no Cloudflare)
             try:
                 await _inject_timer_bypass(page)
             except Exception:
